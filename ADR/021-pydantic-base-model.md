@@ -1,13 +1,14 @@
-# ADR 021: Pydantic BaseModel for Model
+# ADR 021: Optional Pydantic integration via `PydanticModel`
 
 ## Status
 
-Proposed
+Proposed (revised after maintainer feedback; Pydantic stays optional and
+`Model` is not changed).
 
 ## Context
 
 pydynox currently offers two overlapping ways to declare a DynamoDB-backed
-model, and both have structural problems:
+model:
 
 1. The **`Model` class** in [python/pydynox/model.py](../python/pydynox/model.py)
    with `Attribute` descriptors in [python/pydynox/attributes/](../python/pydynox/attributes/).
@@ -23,105 +24,120 @@ model, and both have structural problems:
 
 Users who want both a rich Pydantic schema (descriptions, validators,
 constraints, JSON schema) and pydynox's DynamoDB features today have no path.
-Asking them to "put the DynamoDB config into `model_config`" is blocked by
-Pydantic v2, which reserves `model_config` as a `ConfigDict`.
+
+### Constraint: Pydantic must remain optional
+
+pydynox's core value is speed and a minimal dependency footprint. The Rust
+core handles serialization, compression, encryption, and all AWS SDK calls.
+Making Pydantic a required runtime dependency goes against that principle.
+Pydantic is installed today via the `pydynox[pydantic]` extra and must stay
+optional.
+
+This rules out evolving `Model` into a `pydantic.BaseModel` subclass, which
+would force every user to depend on Pydantic.
 
 ## Decision
 
-Evolve `Model` so that it **is a `pydantic.BaseModel`** subclass. Field
-declaration uses idiomatic Pydantic:
+Introduce a new, **opt-in** `PydanticModel` class that inherits from both
+`Model` and `pydantic.BaseModel`:
 
 ```python
-class User(Model):
-    dynamodb_config: ClassVar[DynamoConfig] = DynamoConfig(table="users")
-
-    pk:    Annotated[str, Dynamo.PartitionKey(template="USER#{email}")] = Field(description="User PK")
-    email: str = Field(description="Email address")
-    ssn:   Annotated[str, Dynamo.Encrypted(key_id="alias/my-key")] = Field(default=None)
-
-    email_index = GlobalSecondaryIndex(index_name="email-index", partition_key="email")
+from pydynox import Model          # no Pydantic; works exactly as today
+from pydynox import PydanticModel  # Model + BaseModel; requires pydynox[pydantic]
 ```
 
-Key points:
+`PydanticModel` lives in a new module
+[python/pydynox/pydantic_model.py](../python/pydynox/pydantic_model.py) and is
+lazily imported: a user without Pydantic installed can still
+`import pydynox` and use `Model` as today; only `from pydynox import
+PydanticModel` triggers the import and raises a clear `ImportError` with a
+pointer to `pip install pydynox[pydantic]` if Pydantic is missing.
 
-- The existing `Attribute` subclasses (`StringAttribute`, `EncryptedAttribute`,
-  `JSONAttribute`, ...) remain as the **internal runtime representation** that
-  carries `serialize` / `deserialize` / `alias` / `attr_type` /
-  `has_template` / `placeholders`. They are no longer typed in class bodies.
-- Declarations use PEP 593 `Annotated[T, Dynamo.*]` markers to convey DynamoDB
-  semantics, plus Pydantic's `Field(...)` for everything else.
-- Per-model configuration moves to `dynamodb_config: ClassVar[DynamoConfig]`
-  because `model_config` belongs to Pydantic.
-- Condition and atomic-op builders move from `User.pk == "x"` to
-  `User.F.pk == "x"` (a sibling namespace), because Pydantic owns class-level
-  field access.
+Supporting changes, all additive and non-breaking:
 
-The refactor ships as five staged PRs so each step is reviewable and,
-for PRs 1-3, non-breaking. See
-[docs/refactor/pydantic-model/overview.md](../docs/refactor/pydantic-model/overview.md)
-for the full plan.
+- Rename `ModelConfig` to `DynamoConfig` and expose a new
+  `dynamodb_config: ClassVar[DynamoConfig]` attribute so `PydanticModel`
+  subclasses can also set Pydantic's `model_config = ConfigDict(...)`
+  without a naming collision. See
+  [docs/refactor/pydantic-model/01-dynamoconfig-rename.md](../docs/refactor/pydantic-model/01-dynamoconfig-rename.md).
+- Add `Annotated[T, Dynamo.*]` markers as an alternative declaration style
+  for fields, since `PydanticModel` cannot use class-body `Attribute`
+  descriptors. `Model` users keep both styles. See
+  [docs/refactor/pydantic-model/02-annotated-markers.md](../docs/refactor/pydantic-model/02-annotated-markers.md).
+- Add a `cls.F` namespace for condition and atomic operators, because
+  Pydantic owns class-level field access on `PydanticModel` and
+  `User.pk == "x"` cannot work there. `Model` users gain `cls.F` as a
+  sibling path but keep the existing descriptor style with no warnings.
+  See [docs/refactor/pydantic-model/03-fields-namespace.md](../docs/refactor/pydantic-model/03-fields-namespace.md).
+- Deprecate the `@dynamodb_model` decorator and point users at
+  `PydanticModel` as the canonical Pydantic path. See
+  [docs/refactor/pydantic-model/05-deprecate-decorator.md](../docs/refactor/pydantic-model/05-deprecate-decorator.md).
 
 ## Reasons
 
-- **Users gain Pydantic's full feature surface for free**: `Field(description=...)`,
-  `Field(examples=..., ge=..., pattern=...)`, `@field_validator`,
-  `@model_validator`, `model_json_schema()`, `model_dump_json()`, discriminated
-  unions, nested `BaseModel` fields.
-- **The DynamoDB layer is preserved**: almost all downstream code
-  (CRUD, GSI/LSI, transactions, hooks, metrics, `create_table`) consumes the
-  `_attributes` / `_py_to_dynamo` / `_indexes` class dunders, not the
-  descriptor protocol. Populating those dunders from Pydantic `FieldInfo`
-  instead of class-body descriptors is a localized metaclass change.
-- **Two worlds collapse to one**: the `@dynamodb_model` decorator becomes
-  obsolete once subclassing `Model` already gives you a Pydantic model.
-- **Layered rollout**: PRs 1-3 add the new surface without removing the old
-  one, so early adopters can migrate gradually; PR 4 performs the cutover
-  in a major version.
+- **Zero new required dependencies.** Pydantic stays behind the
+  `pydynox[pydantic]` extra. Users who do not want it pay nothing and see
+  no API change.
+- **Single codebase for the DynamoDB feature set.** `PydanticModel`
+  inherits from `Model`, so GSI/LSI, transactions, batch, hooks, metrics,
+  `create_table`, atomic ops, version, TTL, encryption, compression, S3
+  offload, discriminator, and auto-generate are all shared. No duplicated
+  implementation.
+- **No breaking changes.** All five PRs in the rollout ship on minor
+  versions. Existing `Model` subclasses keep working unchanged.
+- **Clean deprecation path for `@dynamodb_model`.** Users wanting Pydantic
+  migrate to `PydanticModel` and gain the full DynamoDB feature set at
+  the same time.
 
 ## Alternatives considered
 
-- **Leave the two worlds as-is**: rejected. The decorator path has been
-  steadily accumulating feature gaps (no aliases, no templates, no indexes,
-  no hooks, no encryption, ...), and reconciling them ad hoc would double
+- **Make `Model` a `BaseModel` directly** (original proposal): rejected.
+  Forces Pydantic as a required dependency, violates the minimal-dependency
+  principle, and would break every existing user with a major-version
+  bump. The maintainer pushed back explicitly on this in
+  [question.md](../question.md).
+- **Leave the two worlds as-is**: rejected. The decorator path keeps
+  accumulating feature gaps (no aliases, no templates, no indexes, no
+  hooks, no encryption, ...), and reconciling them ad hoc would double
   the work.
 - **Extend the decorator path to reach feature parity**: rejected. It would
   require re-implementing the entire `Attribute` serialize/deserialize
   pipeline, `ModelMeta` collection, and index binding on top of ad hoc
   monkey-patching in [python/pydynox/integrations/_base.py](../python/pydynox/integrations/_base.py).
   The result would be two parallel implementations of the same logic.
-- **Keep `Attribute` descriptors and just add Pydantic validation on top**:
-  rejected. Pydantic's `BaseModel` owns `__init__`, `__setattr__`, and class
-  creation; you cannot mix class-body descriptors with Pydantic fields
-  without extreme metaclass gymnastics, and users would lose `Field(...)`
-  declarations on the affected attributes anyway.
 - **Reuse `model_config` for DynamoDB settings**: rejected. Pydantic v2
   reserves that name for `ConfigDict`; arbitrary keys get warnings and
-  type-checked shape. A separate `dynamodb_config` name is the clean fix.
+  type-checked shape. A separate `dynamodb_config` name is the clean fix,
+  and it benefits `Model` users too by avoiding confusion with pydantic's
+  naming convention.
 
 ## Consequences
 
 Positive:
 
-- Users get `Field(description=...)` and every other Pydantic feature.
-- The existing `Attribute` machinery stays as internal implementation detail,
-  so serialization/encryption/compression/S3/TTL/version/sets all work
-  unchanged.
-- GSI/LSI, hooks, transactions, batch, `create_table`, metrics, collections,
-  parallel scan, PartiQL: no changes, they read `cls._attributes` and friends.
-- The deprecated decorator path goes away; one canonical way to declare
-  a DynamoDB model.
+- `Model` users see zero change beyond the additive `cls.F` namespace and
+  the optional `dynamodb_config` name.
+- `PydanticModel` users get every Pydantic feature
+  (`Field(description=...)`, `Field(pattern=..., ge=..., max_length=...)`,
+  `@field_validator`, `@model_validator`, `model_json_schema()`,
+  `model_dump_json()`, discriminated unions, nested `BaseModel` fields)
+  **and** every pydynox DynamoDB feature.
+- Only one class to maintain for DynamoDB logic. `PydanticModel` is a
+  thin layer over `Model`.
+- Clean story for deprecating `@dynamodb_model`: point users at
+  `PydanticModel`.
 
 Negative / trade-offs:
 
-- **Single breaking change**: `User.pk == "x"` becomes `User.F.pk == "x"`.
-  A descriptor shim is provided for one release with `DeprecationWarning`.
-- **PR 4 is a major version**. PRs 1-3 are non-breaking (minor versions).
-- **`__setattr__`-based dirty tracking** must cooperate with Pydantic's
-  `validate_assignment`. Regression tests for `is_dirty`/`changed_fields`
-  must accompany PR 4.
-- **Templates** on key fields now rely on a `@model_validator(mode="after")`
-  plus the existing `_build_template_keys` call in `save()`; must be
-  covered with tests.
+- Two public model base classes (`Model` and `PydanticModel`) instead of
+  one. Documentation must explain when to pick which.
+- `PydanticModel` users must use `Annotated[...]` declarations
+  (`pk: Annotated[str, Dynamo.PartitionKey()]`) and `cls.F.pk == "x"` for
+  conditions. These are Pydantic's constraints, not pydynox's choice.
+- `__setattr__`-based dirty tracking must cooperate with Pydantic's
+  `validate_assignment` on `PydanticModel`. Handled in the PR 4 design by
+  delegating to `BaseModel.__setattr__` first and then updating change
+  tracking.
 
 ## References
 
@@ -133,7 +149,9 @@ Negative / trade-offs:
   [02-annotated-markers.md](../docs/refactor/pydantic-model/02-annotated-markers.md)
 - PR 3 (non-breaking):
   [03-fields-namespace.md](../docs/refactor/pydantic-model/03-fields-namespace.md)
-- PR 4 (breaking, major version):
-  [04-basemodel-cutover.md](../docs/refactor/pydantic-model/04-basemodel-cutover.md)
-- PR 5 (post-cutover cleanup):
+- PR 4 (non-breaking; introduces `PydanticModel`):
+  [04-pydantic-model.md](../docs/refactor/pydantic-model/04-pydantic-model.md)
+- PR 5 (non-breaking; deprecates the decorator):
   [05-deprecate-decorator.md](../docs/refactor/pydantic-model/05-deprecate-decorator.md)
+- Maintainer feedback that prompted this revision:
+  [question.md](../question.md)

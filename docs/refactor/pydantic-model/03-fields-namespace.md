@@ -2,20 +2,29 @@
 
 **Summary**: add a `cls.F` namespace exposing one `AttributeRef` per field.
 `AttributeRef` carries the condition and atomic operators currently defined
-directly on `Attribute`. Both styles work after this PR; the old style emits
-a deprecation warning on class-level access.
+directly on `Attribute`. Both styles work after this PR on `Model`. No
+deprecation warnings.
 
 ## Motivation
 
 Today `User.pk == "x"` works because `Attribute` is a class-level descriptor
-whose `__eq__` returns a `ConditionComparison`. PR 4 makes `Model` a
-`BaseModel` and class-level `User.pk` becomes a `FieldInfo` - the operator
-overloads would be lost.
+whose `__eq__` returns a `ConditionComparison`. That depends on class-level
+field access returning the descriptor itself.
 
-This PR introduces the replacement access path, `User.F.pk == "x"`, so users
-can migrate before the breaking change. The implementation is additive and
-delegates to the exact same `Condition*` and `Atomic*` classes used today,
-so downstream code (transactions, update, query, scan) does not change.
+PR 4 introduces an opt-in `PydanticModel(Model, BaseModel)` class. On a
+Pydantic `BaseModel` subclass, class-level `User.pk` is a `FieldInfo` (or
+raises `AttributeError`) - Pydantic owns that namespace, and the operator
+overloads cannot run. `PydanticModel` therefore needs a different access
+path for conditions and atomic operations.
+
+This PR introduces the replacement access path, `cls.F.pk`, available on
+both `Model` and `PydanticModel`. On `Model` it is a sibling to the
+existing descriptor syntax: users can pick whichever they prefer. On
+`PydanticModel` it is the only way to build conditions and atomics.
+
+The implementation delegates to the exact same `Condition*` and `Atomic*`
+classes used today, so downstream code (transactions, update, query, scan)
+does not change.
 
 ## Scope
 
@@ -33,14 +42,14 @@ In:
   `cls._attributes`, accessible as `cls.F` (both class-level and
   instance-level; both return the same namespace).
 - `cls.F["pk"]` string lookup for dynamic builders.
-- A deprecation shim on the existing `Attribute` class: the operator
-  overloads still work but emit `DeprecationWarning` once per class+attr
-  pair, pointing at `cls.F.<name>`.
 
 Out:
 
-- Turning `Model` into a `BaseModel`. PR 4.
-- Removing the descriptor operators entirely. PR 4.
+- Introducing `PydanticModel`. PR 4.
+- Deprecating or removing the descriptor-style operators on `Model`.
+  Not scheduled. The descriptor style stays a first-class citizen on
+  `Model` indefinitely. Documentation recommends `cls.F` as the canonical
+  path but does not nag users who prefer `User.pk == "x"`.
 
 ## Design
 
@@ -65,7 +74,8 @@ and [python/pydynox/_internal/_atomic.py](../../../python/pydynox/_internal/_ato
 
 `_FieldsNamespace` is lazy: it is built once per class in
 `ModelMeta.__new__` after `_attributes` is populated, and memoized on
-`cls._F_namespace`.
+`cls._F_namespace`. The same population runs for `PydanticModel` via the
+combined metaclass in PR 4.
 
 ## Files touched
 
@@ -75,14 +85,12 @@ and [python/pydynox/_internal/_atomic.py](../../../python/pydynox/_internal/_ato
   - at the end of `ModelMeta.__new__` (after index binding, around line
   167), build and attach the `F` namespace:
   `cls.F = _FieldsNamespace(cls._attributes)`.
-- [python/pydynox/attributes/base.py](../../../python/pydynox/attributes/base.py)
-  - wrap each condition / atomic method on `Attribute` with a
-  `_warn_descriptor_usage()` call on first use per (class, attr) pair.
 - [python/pydynox/__init__.py](../../../python/pydynox/__init__.py) - export
   `AttributeRef` for type annotations.
-- [tests/](../../../tests/) - full parity tests + deprecation warning tests.
+- [tests/](../../../tests/) - parity tests (descriptor-style vs `cls.F`)
+  and string-lookup tests.
 - [docs/guides/](../../../docs/guides/) - update the conditions guide to
-  use `cls.F.*`.
+  recommend `cls.F.*` and show both styles work on `Model`.
 
 ## Public API changes
 
@@ -100,7 +108,7 @@ users = User.sync_query(
 )
 ```
 
-After (old still works with warning; new is idiomatic):
+After (old keeps working, new is the documented style):
 
 ```python
 users = User.sync_query(
@@ -146,13 +154,14 @@ def build_filter(field: str, value: Any) -> Condition:
 ## Back-compat and deprecation notes
 
 - **All existing code keeps working** after this PR. Nothing is removed.
-- First class-level descriptor usage (`User.pk == "x"`) emits
-  `DeprecationWarning` once per (class, attribute) pair. Message points to
-  `cls.F.pk`.
-- Warning filter key is stable, so `warnings.filterwarnings("ignore",
-  category=DeprecationWarning, module="pydynox")` still silences it for
-  users who want time before migrating.
-- PR 4 removes the descriptor-style operators entirely.
+- **No deprecation warnings** are emitted for descriptor-style operators.
+  The previous plan wired a `DeprecationWarning` on `User.pk == "x"`; that
+  has been dropped because `Model` is no longer scheduled for a `BaseModel`
+  cutover, and the descriptor style will keep working indefinitely.
+- On `PydanticModel` (PR 4), `User.pk == "x"` is simply unavailable because
+  Pydantic occupies class-level field access. `cls.F.pk == "x"` is the
+  only supported form there, and that is a Pydantic constraint rather than
+  a pydynox deprecation.
 
 ## Test plan
 
@@ -176,11 +185,10 @@ Cover:
 - Aliased fields: `User.F.<py_name>` uses the DynamoDB alias in serialized
   output, matching today's behavior.
 
-### Deprecation warning
+### No deprecation warning
 
-- `pytest.warns(DeprecationWarning)` on first descriptor use.
-- No warning on second descriptor use on the same `(class, attr)` pair.
-- No warning on `cls.F.<attr>` use.
+- `warnings.catch_warnings()` around `User.pk == "x"` asserts no
+  `DeprecationWarning` (or any pydynox-originated warning) is emitted.
 
 ### Dynamic lookup
 
@@ -190,16 +198,20 @@ Cover:
 ### Integration
 
 Re-run the existing query / transaction / update integration tests with all
-uses rewritten to `cls.F.*`; must pass identically.
+uses rewritten to `cls.F.*`; must pass identically. Run a shadow copy with
+the original descriptor-style uses; must also pass identically with no
+warnings.
 
 ## Size
 
-M. Roughly 200-300 LOC added (`_refs.py` + wiring), 30-60 LOC changed
-(warning shim in `attributes/base.py`). Tests are the bulk.
+M. Roughly 200-300 LOC added (`_refs.py` + wiring). Tests are the bulk.
+No warning shim; no changes to
+[python/pydynox/attributes/base.py](../../../python/pydynox/attributes/base.py)
+operator methods.
 
 ## Depends on / unblocks
 
 - Depends on: nothing hard, but lands after PR 1 and PR 2 so the docs
   examples already show the new `dynamodb_config` + `Annotated` style.
-- Unblocks: PR 4. The descriptor style is removed in PR 4; users who
-  migrated to `cls.F.*` see no change.
+- Unblocks: PR 4. `PydanticModel` requires `cls.F.*` because Pydantic
+  owns class-level field access on `BaseModel` subclasses.

@@ -7,13 +7,15 @@ aliases for back-compat. No behavior change.
 ## Motivation
 
 Pydantic v2 reserves `model_config` on every `BaseModel` as its own
-`ConfigDict`. PR 4 turns `Model` into a `BaseModel`, so `model_config` must
-stop referring to the pydynox dataclass. This PR does the rename in advance,
-in a non-breaking way, so users can migrate at their own pace before the
-breaking cutover.
+`ConfigDict`. PR 4 introduces a new `PydanticModel(Model, BaseModel)` class
+that needs `model_config` free for Pydantic's `ConfigDict(...)`. A separate
+`dynamodb_config` name avoids the collision there.
 
-Doing this first also gives us a clean slate when PR 4 adds Pydantic's own
-`model_config = ConfigDict(...)` without overloading names.
+The rename also helps `Model` users: `dynamodb_config` makes it obvious
+that the value configures DynamoDB behavior (table, client, hot-partition
+overrides) rather than being a generic Pydantic-style config. `Model`
+users keep `model_config = ModelConfig(...)` working indefinitely; this
+PR is non-breaking.
 
 ## Scope
 
@@ -30,7 +32,7 @@ In:
 
 Out:
 
-- Making `Model` a `BaseModel`. That is PR 4.
+- Introducing `PydanticModel`. That is PR 4.
 - Any `Annotated` markers. That is PR 2.
 - Any condition / atomic API changes. That is PR 3.
 
@@ -103,11 +105,14 @@ All existing `_get_client` / `_get_table` / `_apply_hot_partition_overrides` /
 
 - `ModelConfig` stays importable from [python/pydynox/config.py](../../../python/pydynox/config.py)
   as `ModelConfig: TypeAlias = DynamoConfig`.
-- Setting `model_config = ModelConfig(...)` on a class body keeps working.
-  First access emits `DeprecationWarning` with a pointer to the migration
-  guide. Warning is class-cached so noisy repeat warnings do not flood
-  logs.
-- No removal in this PR. Removal happens in PR 4.
+- Setting `model_config = ModelConfig(...)` on a `Model` class body keeps
+  working. First access emits `DeprecationWarning` with a pointer to the
+  migration guide. Warning is class-cached so noisy repeat warnings do not
+  flood logs.
+- No removal scheduled. `Model` users may keep `model_config` indefinitely;
+  the deprecation exists only to nudge docs and examples toward one canonical
+  name. `PydanticModel` (PR 4) cannot accept the legacy name because
+  Pydantic owns `model_config` there.
 
 ## Test plan
 
@@ -134,5 +139,6 @@ S. Roughly 80-120 LOC added, 40-60 LOC refactored.
 ## Depends on / unblocks
 
 - Depends on: nothing.
-- Unblocks: PR 4 (which removes the `model_config` alias and hands the
-  name back to Pydantic).
+- Unblocks: PR 4 (`PydanticModel` can freely set
+  `model_config = ConfigDict(...)` because pydynox configuration lives
+  under `dynamodb_config`).

@@ -7,14 +7,21 @@ Pydantic-friendly style without losing any DynamoDB semantics.
 
 ## Motivation
 
-PR 4 cannot happen unless there is a declaration syntax that Pydantic
-accepts. PEP 593 `Annotated[T, ...]` is the canonical way to attach
-library-specific metadata to a field while letting the type checker see the
-underlying `T`. This PR introduces that syntax and makes it equivalent to
-the legacy descriptor declarations. Class-body `Attribute` descriptors
-continue to work for now, so this is purely additive.
+PR 4 introduces an opt-in `PydanticModel(Model, BaseModel)` class. Pydantic
+owns class-body assignments on `BaseModel` subclasses, so `PydanticModel`
+cannot accept class-body `Attribute` descriptors the way `Model` does.
+PEP 593 `Annotated[T, ...]` is the canonical way to attach library-specific
+metadata to a field while letting the type checker see the underlying `T`,
+and it is the declaration surface `PydanticModel` needs.
 
-Once this PR lands, users can start migrating at their own pace.
+This PR introduces that syntax and makes it equivalent to the legacy
+descriptor declarations on `Model`. Class-body `Attribute` descriptors
+continue to work on `Model` with no deprecation; the `Annotated` style is
+simply an added option for users who prefer the Pydantic-style layout.
+On `PydanticModel` (PR 4) it will be the only supported style.
+
+This PR is purely additive. `Model` users adopt it at their own pace, or
+never.
 
 ## Scope
 
@@ -32,9 +39,10 @@ In:
 
 Out:
 
-- Making `Model` a `BaseModel`. PR 4.
+- Introducing `PydanticModel`. PR 4.
 - `cls.F` namespace. PR 3.
-- Removing the descriptor style. PR 4.
+- Removing or deprecating the descriptor style on `Model`. Not scheduled;
+  descriptor-style stays a first-class citizen on `Model` indefinitely.
 
 ## Marker inventory
 
@@ -135,9 +143,11 @@ class User(Model):
     ssn:   Annotated[str, Dynamo.Encrypted(key_id="alias/my-key")] = None
 ```
 
-Note: `Field(description=...)` does not work yet - `Model` is not a
-`BaseModel` until PR 4. The `Annotated` syntax lands first so the migration
-path exists before the breaking change.
+Note: `Field(description=...)` has no effect on plain `Model`, because
+`Model` is not a `BaseModel`. The `Annotated` syntax lands first so the
+declaration surface exists before `PydanticModel` (PR 4) starts consuming
+it. On `PydanticModel`, `Field(description=...)`, validators, JSON schema,
+and friends all work alongside the `Dynamo.*` markers.
 
 ## Back-compat and deprecation notes
 
@@ -191,5 +201,5 @@ changed in `ModelMeta`. No removals.
 
 - Depends on: PR 1 (so users can also write `dynamodb_config` in the
   examples; not strictly required).
-- Unblocks: PR 4 (declaration syntax must exist before Pydantic takes
-  over class body).
+- Unblocks: PR 4 (`PydanticModel` relies on `Annotated[T, Dynamo.*]` as
+  its only declaration style; it cannot accept class-body descriptors).

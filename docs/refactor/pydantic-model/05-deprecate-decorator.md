@@ -1,19 +1,23 @@
 # PR 5: Deprecate `@dynamodb_model` and consolidate docs
 
-**Summary**: now that subclassing `Model` gives users a fully Pydantic-capable
-DynamoDB model, the `@dynamodb_model` decorator becomes redundant. This PR
-adds a `DeprecationWarning`, updates all docs/examples to point at the
-unified `Model(BaseModel)` path, and (optionally) prefers native pydantic
-nested `BaseModel` over `JSONAttribute[M]` in guides.
+**Summary**: now that subclassing `PydanticModel` gives users a fully
+Pydantic-capable DynamoDB model, the `@dynamodb_model` decorator becomes
+redundant. This PR adds a `DeprecationWarning`, updates all docs/examples
+to point at `PydanticModel` (or plain `Model` for users who do not want
+Pydantic), and (optionally) prefers native pydantic nested `BaseModel`
+over `JSONAttribute[M]` in guides.
 
 ## Motivation
 
 Pre-refactor the decorator existed because subclassing `Model` meant giving
-up Pydantic features. After PR 4 that trade-off is gone. Keeping two paths
-will confuse users, split documentation, and create maintenance drag.
+up Pydantic features and the pydantic path gave up almost every DynamoDB
+feature. After PR 4 (`PydanticModel`) that trade-off is gone. Keeping two
+paths that both integrate Pydantic will confuse users, split documentation,
+and create maintenance drag.
 
 This PR does **not** remove the decorator. Removal would break users who
-pinned to the old path. Deprecation here, removal in a later major.
+pinned to the old path. Deprecation here; removal is left to a later major
+release.
 
 ## Scope
 
@@ -52,9 +56,9 @@ Code:
 - [python/pydynox/integrations/functions.py](../../../python/pydynox/integrations/functions.py)
   - add the same warning in its `dynamodb_model` entry point.
 - [python/pydynox/integrations/dataclass.py](../../../python/pydynox/integrations/dataclass.py)
-  - same treatment for `from_dataclass`. Document that pydantic's
-  `dataclass` decorator composed with `Model(BaseModel)` is the
-  recommended path going forward.
+  - same treatment for `from_dataclass`. Document `PydanticModel` as the
+  recommended path going forward for users who want validation + schema,
+  and plain `Model` for users who do not want Pydantic at all.
 - [python/pydynox/integrations/__init__.py](../../../python/pydynox/integrations/__init__.py)
   - add a module-level deprecation note in the docstring.
 - [python/pydynox/__init__.py](../../../python/pydynox/__init__.py) - keep
@@ -86,8 +90,9 @@ emits:
 
 ```text
 DeprecationWarning: pydynox @dynamodb_model is deprecated since X.Y.0.
-Subclass pydynox.Model directly - you now get Pydantic features and the
-full DynamoDB feature set in one place. See
+Subclass pydynox.PydanticModel instead - you get Pydantic features and the
+full DynamoDB feature set in one place. If you do not need Pydantic, plain
+pydynox.Model works without any Pydantic dependency. See
 docs/refactor/pydantic-model/overview.md for the migration guide.
 ```
 
@@ -112,16 +117,16 @@ user = User(pk="USER#1", name="John")
 await user.save()
 ```
 
-After:
+After (for users who want Pydantic features):
 
 ```python
 from typing import Annotated, ClassVar
 from pydantic import Field
-from pydynox import Model, DynamoConfig, Dynamo, DynamoDBClient, set_default_client
+from pydynox import PydanticModel, DynamoConfig, Dynamo, DynamoDBClient, set_default_client
 
 set_default_client(DynamoDBClient(region="us-east-1"))
 
-class User(Model):
+class User(PydanticModel):
     dynamodb_config: ClassVar[DynamoConfig] = DynamoConfig(table="users")
 
     pk:   Annotated[str, Dynamo.PartitionKey()] = Field(description="User PK")
@@ -131,9 +136,31 @@ user = User(pk="USER#1", name="John")
 await user.save()
 ```
 
-The second form gives you everything the decorator form had, plus
-encryption, S3 offload, GSI/LSI query, transactions, hooks, atomic ops,
-discriminator, version, TTL, auto-generate, dirty tracking, and metrics.
+After (for users who do **not** want Pydantic; drops the `pydynox[pydantic]`
+extra entirely):
+
+```python
+from typing import ClassVar
+from pydynox import Model, DynamoConfig, DynamoDBClient, set_default_client
+from pydynox.attributes import StringAttribute
+
+set_default_client(DynamoDBClient(region="us-east-1"))
+
+class User(Model):
+    dynamodb_config: ClassVar[DynamoConfig] = DynamoConfig(table="users")
+
+    pk   = StringAttribute(partition_key=True)
+    name = StringAttribute()
+
+user = User(pk="USER#1", name="John")
+await user.save()
+```
+
+Either target gives you everything the decorator form had plus the full
+DynamoDB feature set: encryption, S3 offload, GSI/LSI query, transactions,
+hooks, atomic ops, discriminator, version, TTL, auto-generate, dirty
+tracking, and metrics. Only the `PydanticModel` target also keeps Pydantic
+validation, descriptions, and JSON schema.
 
 ## Back-compat and deprecation notes
 
